@@ -1,0 +1,41 @@
+page_separation:
+  input: 'inference_input'
+  left: '_01'
+  right: '_02'
+  single: '_00'
+  ext: '.jpg'
+  quality: 100
+  log: 'trim_pos.tsv'
+  config_path: 'submodules/separate_pages_mmdet/models/cascade_rcnn_r50_fpn_1x_ndl_1024.py'
+  weight_path: 'submodules/separate_pages_mmdet/models/epoch_180.pth'
+  allow_invalid_num_output: True
+  silence_tf_log: True
+page_deskew:
+  r_angle: 0
+  skew_max: 4.0
+  acc_deg: 0.1
+  method: 1
+  gray: 1.0
+  quality: 100
+  short: null
+  roi_w: 1.0
+  roi_h: 1.0
+layout_extraction:
+  config_path: 'submodules/ndl_layout/models/cascade_mask_rcnn_convnext-t_p4_w7_fpn_giou_4conv1f_fp16_ms-crop_3x_coco.py'
+  checkpoint_path: 'submodules/ndl_layout/models/ndl_retrainmodel.pth'
+  device: 'cuda:0'
+  score_thr: 0.3
+line_ocr:
+  char_list: 'submodules/text_recognition_lightning/ndldata/mojilist_NDL.txt'
+  saved_model: 'submodules/text_recognition_lightning/models/resnet-orient2.ckpt'
+  additional_elements:
+    柱: True
+    ノンブル: True
+    ルビ: True
+line_order: True
+ruby_read: True
+line_attribute:
+  add_title_author: True
+  classifier: 'rf'
+  title_model: 'submodules/text_recognition_lightning/models/rf_title/model.pkl'
+  author_model: 'submodules/text_recognition_lightning/models/rf_author/model.pkl'

@@ -1,0 +1,10 @@
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+output_data*/
+input_data/
+input_data_*/
+__pycache__/
+*.pyc
+.git/

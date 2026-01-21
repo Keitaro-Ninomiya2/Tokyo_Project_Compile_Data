@@ -1,0 +1,36 @@
+[submodule "src/separate_pages_ssd"]
+	path = src/separate_pages_ssd
+	url = https://github.com/ndl-lab/separate_pages_ssd.git
+[submodule "src/deskew_HT"]
+	path = src/deskew_HT
+	url = https://github.com/ndl-lab/deskew_HT.git
+[submodule "src/text_recognition"]
+	path = src/text_recognition
+	url = https://github.com/ndl-lab/text_recognition.git
+[submodule "src/ndl_layout"]
+	path = src/ndl_layout
+	url = https://github.com/ndl-lab/ndl_layout.git
+[submodule "submodules/deskew_HT"]
+	path = submodules/deskew_HT
+	url = https://github.com/ndl-lab/deskew_HT
+	branch = master
+[submodule "submodules/separate_pages_mmdet"]
+	path = submodules/separate_pages_mmdet
+	url = https://github.com/ndl-lab/separate_pages_mmdet
+	branch = feature/ver.2.1-pytorch
+[submodule "submodules/ndl_layout"]
+	path = submodules/ndl_layout
+	url = https://github.com/ndl-lab/ndl_layout
+	branch = feature/ver.2.1-pytorch2.0
+[submodule "submodules/reading_order"]
+	path = submodules/reading_order
+	url = https://github.com/ndl-lab/reading_order
+	branch = master
+[submodule "submodules/ruby_prediction"]
+	path = submodules/ruby_prediction
+	url = https://github.com/ndl-lab/ruby_prediction
+	branch = master
+[submodule "submodules/text_recognition_lightning"]
+	path = submodules/text_recognition_lightning
+	url = https://github.com/ndl-lab/text_recognition_lightning
+	branch = feature/colab
