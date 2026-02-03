@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Ignore Data
+Raw_Data/
+Processed_Data/
+*.jpg
+*.png
