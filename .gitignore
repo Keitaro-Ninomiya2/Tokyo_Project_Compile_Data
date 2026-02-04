@@ -5,6 +5,8 @@ output_data_final*
 *.jpg
 *.json
 *.xml
+submodules/
+.conda/
 
 # Ignore system and environment files
 submodules/
