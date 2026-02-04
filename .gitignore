@@ -6,10 +6,8 @@ output_data_final*
 *.json
 *.xml
 
-# Ignore heavy models and environments
+# Ignore system and environment files
 submodules/
 .conda/
 .venv/
-
-# Ignore OS files
 .DS_Store
