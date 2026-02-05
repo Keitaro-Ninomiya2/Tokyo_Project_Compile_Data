@@ -11,7 +11,6 @@ def load_position_titles(csv_path, column_name='DuringWar'):
         print(f"Warning: Crosswalk file not found at {csv_path}")
         return []
     try:
-        # Try UTF-8, fallback to Shift-JIS
         try:
             df = pd.read_csv(csv_path, encoding='utf-8')
         except UnicodeDecodeError:
@@ -24,15 +23,34 @@ def load_position_titles(csv_path, column_name='DuringWar'):
         titles.sort(key=len, reverse=True)
         return titles
     except Exception as e:
-        print(f"Warning: Could not load crosswalk ({e}). Splitting might be less accurate.")
+        print(f"Warning: Could not load crosswalk ({e}).")
         return []
 
+def parse_imperial_metadata(raw_text):
+    """
+    Dissects strings like '月八五結束進一七上, 時田愼雄' 
+    into Salary, Rank, and Clean Name.
+    """
+    if not raw_text:
+        return "", None, None
+
+    # 1. Extract Salary (e.g., 月八五, 月七五)
+    salary_match = re.search(r'月([一二三四五六七八九十百]+)', raw_text)
+    salary = f"月{salary_match.group(1)}" if salary_match else None
+    
+    # 2. Extract Rank (e.g., 七上, 六下, 八正, 從七)
+    rank_match = re.search(r'([一二三四五六七八九十])([上下正從])', raw_text)
+    rank = rank_match.group(0) if rank_match else None
+    
+    # 3. Clean Name
+    # Remove the salary, rank, and leading/trailing junk/commas
+    clean_name = re.sub(r'月[一二三四五六七八九十百]+|([一二三四五六七八九十])([上下正從])|[\s,、]+', '', raw_text)
+    clean_name = clean_name.strip(' ,.()=+-〓*')
+    
+    return clean_name, salary, rank
+
 def split_position_and_name(text, titles):
-    """
-    Splits a combined string like "Secretary Tanaka" into ("Secretary", "Tanaka").
-    """
     clean_text = str(text).strip()
-    # Remove noise symbols for cleaner splitting
     clean_text = re.sub(r'[【ヿ〓○●◎]', '', clean_text)
     
     for title in titles:
@@ -44,25 +62,23 @@ def split_position_and_name(text, titles):
 
 def main():
     parser = argparse.ArgumentParser(description="Compile parsed lines into a structured DataFrame")
-    parser.add_argument("--input_csv", required=True, help="The labeled CSV file")
-    parser.add_argument("--crosswalk", required=True, help="PositionCrosswalk.csv")
-    parser.add_argument("--output", default="Final_Compiled_Directory.csv", help="Output filename")
+    parser.add_argument("--input_csv", required=True)
+    parser.add_argument("--crosswalk", required=True)
+    parser.add_argument("--output", default="Final_Compiled_Directory.csv")
     parser.add_argument("--year_col", default="DuringWar")
-    
     args = parser.parse_args()
 
-    print(f"Loading data from {args.input_csv}...")
     df = pd.read_csv(args.input_csv)
     df['text'] = df['text'].fillna("")
-
     known_titles = load_position_titles(args.crosswalk, args.year_col)
+
+    # Singular high-ranking titles that should not "stick" to subordinates
+    SINGULAR_TITLES = ["區長", "局長", "課長", "署長", "館長", "所長", "会長", "院長", "校長"]
 
     current_office = "Unknown Office"
     current_position = "Employee" 
     compiled_rows = []
 
-    print("Compiling entries into structured format...")
-    
     for idx, row in df.iterrows():
         label = str(row['label'])
         text = str(row['text']).strip()
@@ -71,66 +87,57 @@ def main():
         img_name = row.get('image_name', '')
         folder_num = row.get('sort_folder_num', '')
 
-        # --- Hierarchy Logic ---
         if label == 'Office':
             current_office = text
-            current_position = "Employee" # Reset position inside new office
+            current_position = "Employee"
             
         elif label == 'Position':
             current_position = text
             
-        elif label == 'Position_and_Name':
-            pos_part, name_part = split_position_and_name(text, known_titles)
-            if pos_part:
-                current_position = pos_part
-            
-            if name_part:
-                # Rule: One name per row (expand commas)
-                names = [n.strip() for n in name_part.split(',') if n.strip()]
-                for n in names:
-                    if len(n) < 2: continue
-                    compiled_rows.append({
-                        'folder': folder_num,
-                        'page': page_num,
-                        'image': img_name,
-                        'office': current_office,
-                        'position': current_position,
-                        'name': n,
-                        'drafted': False
-                    })
+        elif label in ['Position_and_Name', 'NameSudachi']:
+            # Handle possible combined position if necessary
+            raw_content = text
+            if label == 'Position_and_Name':
+                pos_part, name_part = split_position_and_name(text, known_titles)
+                if pos_part: current_position = pos_part
+                raw_content = name_part if name_part else text
 
-        elif label == 'NameSudachi':
-            # Rule: One name per row (expand commas)
-            names = [n.strip() for n in text.split(',') if n.strip()]
-            for n in names:
-                if len(n) < 2: continue 
+            # Split entries (in case of multiple names in one block)
+            entries = [e.strip() for e in raw_content.split(',') if e.strip()]
+            
+            for entry in entries:
+                clean_n, sal, rnk = parse_imperial_metadata(entry)
+                if len(clean_n) < 2: continue
+
                 compiled_rows.append({
                     'folder': folder_num,
                     'page': page_num,
                     'image': img_name,
                     'office': current_office,
                     'position': current_position,
-                    'name': n,
+                    'name': clean_n,
+                    'salary_kanji': sal,
+                    'rank_kanji': rnk,
                     'drafted': False
                 })
 
+                # Selective Reset: If the position is a 'Chief' role, reset it immediately
+                if any(singular in current_position for singular in SINGULAR_TITLES):
+                    current_position = "Employee"
+
         elif label == 'Drafted':
-            # Flag the person immediately preceding this row
             if compiled_rows:
                 compiled_rows[-1]['drafted'] = True
 
-    # --- Export ---
     if compiled_rows:
         result_df = pd.DataFrame(compiled_rows)
-        
-        # Only include columns relevant to the final research data
-        cols = ['office', 'position', 'name', 'drafted', 'folder', 'page', 'image']
+        # Added the two new research columns
+        cols = ['office', 'position', 'name', 'salary_kanji', 'rank_kanji', 'drafted', 'folder', 'page', 'image']
         result_df = result_df[cols]
-        
-        result_df.to_csv(args.output, index=False)
-        print(f"Success! {len(result_df)} individual records found.")
+        result_df.to_csv(args.output, index=False, encoding='utf-8-sig')
+        print(f"Success! {len(result_df)} records found. Rank/Salary extracted.")
     else:
-        print("Error: No name entries were compiled. Verify input labels.")
+        print("Error: No entries found.")
 
 if __name__ == "__main__":
     main()
