@@ -20,47 +20,53 @@ DRAFTED_KEYWORDS = ["應召中", "應召", "召中", "應徴中", "應徴", "徴
 KANJI_NUMBERS = '一二三四五六七八九十百千万'
 RANK_PATTERN = re.compile(r'([正従][一二三四五六七八][位]?)')
 
-def load_position_titles(csv_path, column_name='BeforeWar'):
-    if not os.path.exists(csv_path): return []
+def load_position_titles(csv_path, column_name='DuringWar'):
+    if not os.path.exists(csv_path):
+        print(f"CRITICAL ERROR: Crosswalk file not found at {csv_path}")
+        sys.exit(1)
     try:
-        df = pd.read_csv(csv_path)
-        if column_name not in df.columns: column_name = df.columns[0]
-        titles = df[column_name].dropna().unique().tolist()
+        try:
+            df = pd.read_csv(csv_path, encoding='utf-8')
+        except UnicodeDecodeError:
+            df = pd.read_csv(csv_path, encoding='shift-jis')
+        
+        print(f"--- Crosswalk Debug Info ---")
+        print(f"Requested Column: {column_name}")
+        print(f"Available Columns: {df.columns.tolist()}")
+        
+        if column_name not in df.columns:
+            print(f"ERROR: Column '{column_name}' not found. Using first column.")
+            column_name = df.columns[0]
+            
+        titles = df[column_name].dropna().astype(str).str.strip().unique().tolist()
+        titles = [t for t in titles if len(t) > 1]
         titles.sort(key=len, reverse=True)
+        print(f"Successfully loaded {len(titles)} unique position titles.")
         return titles
     except Exception as e:
-        print(f"Error reading position crosswalk: {e}")
-        return []
+        print(f"Error loading CSV: {e}")
+        sys.exit(1)
 
 def clean_ranks(text):
     if not text: return text
     return RANK_PATTERN.sub(r', \1, ', text)
 
 def split_names_greedy(text, tokenizer_obj, mode_c):
-    """
-    Pass 1: Standard splitting using Mode C (Long chunks).
-    """
     if not text or not SUDACHI_AVAILABLE: return text
-    text = clean_ranks(text) # Pre-clean ranks
-
+    text = clean_ranks(text)
     try:
         tokens = list(tokenizer_obj.tokenize(text, mode_c))
         formatted_names = []
         current_name_parts = []
-        
         for token in tokens:
             surface = token.surface()
             pos = token.part_of_speech()
-            
             if surface in [',', '、', ' ', '　']:
                 if current_name_parts:
                     formatted_names.append("".join(current_name_parts))
                     current_name_parts = []
                 continue
-
-            # If Surname detected, start new chunk
             is_surname = (len(pos) > 3 and pos[3] == '姓')
-            
             if is_surname:
                 if current_name_parts:
                     formatted_names.append("".join(current_name_parts))
@@ -68,65 +74,35 @@ def split_names_greedy(text, tokenizer_obj, mode_c):
                 current_name_parts.append(surface)
             else:
                 current_name_parts.append(surface)
-        
         if current_name_parts:
             formatted_names.append("".join(current_name_parts))
-            
         return formatted_names
     except Exception:
         return [text]
 
 def refine_suspicious_names(name_list, tokenizer_obj, mode_a):
-    """
-    Pass 2: Aggressive Split.
-    Uses Mode A (Short Units).
-    Splits if:
-    1. A Surname (姓) is found.
-    2. A Place Name (地名) is found (often used as surnames like Ebara).
-    3. The PREVIOUS token was a Given Name (名) and CURRENT is a Noun (Start of new name).
-    """
     if not SUDACHI_AVAILABLE: return ", ".join(name_list)
-    
     refined_list = []
-    
     for name_segment in name_list:
-        # If segment is short and safe, keep it
         if len(name_segment) <= 4:
             refined_list.append(name_segment)
             continue
-            
-        # Re-tokenize with Mode A
         try:
             tokens = list(tokenizer_obj.tokenize(name_segment, mode_a))
             sub_parts = []
             current_sub = []
-            
             prev_was_given_name = False
-            
             for i, token in enumerate(tokens):
                 surface = token.surface()
                 pos = token.part_of_speech()
-                
-                # POS Checks
                 is_noun = (pos[0] == '名詞')
-                # pos[1] might be 固有名詞 (Proper), pos[2] might be 地名 (Place) or 人名 (Person)
                 is_surname = (len(pos) > 3 and pos[3] == '姓')
                 is_place = (len(pos) > 2 and pos[2] == '地名') 
                 is_given_name = (len(pos) > 3 and pos[3] == '名')
-                
-                # DECISION: Should we split here?
-                # Trigger split if:
-                # A) We are not at start
-                # B) AND (It looks like a Surname OR Place OR (Previous was a Given Name))
                 should_split = False
                 if i > 0:
-                    if is_surname:
+                    if is_surname or is_place or (prev_was_given_name and is_noun):
                         should_split = True
-                    elif is_place: # e.g. Ebara
-                        should_split = True
-                    elif prev_was_given_name and is_noun: # e.g. Hisakichi -> Kon
-                        should_split = True
-                
                 if should_split:
                     if current_sub:
                         sub_parts.append("".join(current_sub))
@@ -134,73 +110,54 @@ def refine_suspicious_names(name_list, tokenizer_obj, mode_a):
                     current_sub.append(surface)
                 else:
                     current_sub.append(surface)
-                
-                # Update state for next token
                 prev_was_given_name = is_given_name
-            
-            if current_sub:
-                sub_parts.append("".join(current_sub))
-            
+            if current_sub: sub_parts.append("".join(current_sub))
             refined_list.extend(sub_parts)
-            
         except Exception:
             refined_list.append(name_segment)
-            
     return ", ".join(refined_list)
 
-def get_sudachi_label(text, tokenizer_obj, mode):
-    if not SUDACHI_AVAILABLE: return None
-    try:
-        tokens = list(tokenizer_obj.tokenize(text, mode))
-        for i, token in enumerate(tokens[:-1]):
-            pos = token.part_of_speech()
-            if len(pos) > 3 and pos[3] == '姓':
-                return 'NameSudachi'
-    except Exception: pass
-    return None
-
 def determine_label(text, position_titles, tokenizer_obj, mode):
-    text_norm = text.replace(" ", "").replace("　", "")
+    # Strip symbols for cleaner matching
+    text_norm = re.sub(r'[【ヿ〓○●◎]', '', text).replace(" ", "").replace("　", "").strip()
     if any(text_norm.endswith(char) for char in OFFICE_ENDINGS): return 'Office'
     if text_norm in position_titles: return 'Position'
     for title in position_titles:
         if text_norm.startswith(title) and len(text_norm) > len(title): return 'Position_and_Name'
     if any(keyword in text_norm for keyword in DRAFTED_KEYWORDS): return 'Drafted'
-    sudachi_label = get_sudachi_label(text_norm, tokenizer_obj, mode)
-    if sudachi_label: return sudachi_label
+    if SUDACHI_AVAILABLE:
+        try:
+            tokens = list(tokenizer_obj.tokenize(text_norm, mode))
+            for token in tokens:
+                pos = token.part_of_speech()
+                if len(pos) > 3 and pos[3] == '姓': return 'NameSudachi'
+        except Exception: pass
     return None
 
 def parse_xml_to_entries(xml_path):
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    entries = []
-    
-    for page in root.findall('.//PAGE'):
-        image_name = page.get('IMAGENAME')
-        
-        page_number = ""
-        for block in page.findall('.//BLOCK'):
-            if block.get('TYPE') == 'ノンブル':
-                page_number = block.get('STRING', "")
-                break
-        
-        for textblock in page.findall('.//TEXTBLOCK'):
-            for line in textblock.findall('.//LINE'):
-                string_val = line.get('STRING')
-                if not string_val: continue
-                try:
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        entries = []
+        for page in root.findall('.//PAGE'):
+            image_name = page.get('IMAGENAME')
+            page_number = ""
+            for block in page.findall('.//BLOCK'):
+                if block.get('TYPE') == 'ノンブル':
+                    page_number = block.get('STRING', "")
+                    break
+            for textblock in page.findall('.//TEXTBLOCK'):
+                for line in textblock.findall('.//LINE'):
+                    string_val = line.get('STRING')
+                    if not string_val: continue
                     entries.append({
-                        'page_number': page_number,
-                        'text': string_val,
-                        'x': int(line.get('X')),
-                        'y': int(line.get('Y')),
-                        'w': int(line.get('WIDTH')),
-                        'h': int(line.get('HEIGHT')),
-                        'image_name': image_name,
-                        'file_path': xml_path
+                        'page_number': page_number, 'text': string_val,
+                        'x': int(line.get('X')), 'y': int(line.get('Y')),
+                        'w': int(line.get('WIDTH')), 'h': int(line.get('HEIGHT')),
+                        'image_name': image_name, 'file_path': xml_path
                     })
-                except ValueError: continue
-    return entries
+        return entries
+    except Exception: return []
 
 def sort_vertical_columns(entries, tolerance=30):
     if not entries: return []
@@ -229,30 +186,27 @@ def main():
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--crosswalk", required=True)
     parser.add_argument("--output", default="labeled_output.csv")
-    parser.add_argument("--year_col", default="BeforeWar")
+    parser.add_argument("--year_col", default="DuringWar")
     args = parser.parse_args()
 
-    # Init Sudachi (Load TWO modes)
+    # Init Sudachi
     tokenizer_obj = None
     mode_c = None
     mode_a = None
     if SUDACHI_AVAILABLE:
         try:
             tokenizer_obj = dictionary.Dictionary(dict="core").create()
-            mode_c = tokenizer.Tokenizer.SplitMode.C # Complex (Standard)
-            mode_a = tokenizer.Tokenizer.SplitMode.A # Short (Granular)
-        except Exception as e: print(f"Sudachi init failed: {e}")
+            mode_c = tokenizer.Tokenizer.SplitMode.C
+            mode_a = tokenizer.Tokenizer.SplitMode.A
+        except Exception: pass
 
     position_titles = load_position_titles(args.crosswalk, args.year_col)
-
-    search_pattern = os.path.join(args.input_dir, "**", "*.xml")
-    xml_files = glob.glob(search_pattern, recursive=True)
-    if not xml_files and os.path.isfile(args.input_dir):
-        xml_files = [args.input_dir]
-
+    xml_files = glob.glob(os.path.join(args.input_dir, "**", "input_data.sorted.xml"), recursive=True)
     all_data = []
 
     for xml_file in xml_files:
+        match = re.search(r'Page(\d+)', xml_file)
+        folder_num = int(match.group(1)) if match else 999999
         raw_entries = parse_xml_to_entries(xml_file)
         
         pages = {}
@@ -260,40 +214,47 @@ def main():
             img = entry['image_name']
             if img not in pages: pages[img] = []
             pages[img].append(entry)
-        
-        def page_sort_key(name):
-            n = name.lower()
-            if 'right' in n: return 0
-            if 'left' in n: return 1
-            return 2
             
-        sorted_page_names = sorted(pages.keys(), key=page_sort_key)
-        
-        for page_name in sorted_page_names:
-            page_entries = pages[page_name]
-            sorted_entries = sort_vertical_columns(page_entries)
-            
+        for page_name in sorted(pages.keys(), key=lambda x: 0 if 'right' in x.lower() else 1):
+            sorted_entries = sort_vertical_columns(pages[page_name])
             for entry in sorted_entries:
                 label = determine_label(entry['text'], position_titles, tokenizer_obj, mode_c)
                 entry['label'] = label
+                entry['sort_folder_num'] = folder_num
                 
-                # Apply Double-Pass Separation
-                if label == 'NameSudachi':
-                    # Pass 1: Standard Split
-                    initial_split = split_names_greedy(entry['text'], tokenizer_obj, mode_c)
-                    # Pass 2: Aggressive NER Audit
-                    final_text = refine_suspicious_names(initial_split, tokenizer_obj, mode_a)
-                    entry['text'] = final_text
+                # Handling Position Split while preserving original metadata
+                if label == 'Position_and_Name':
+                    clean_text = re.sub(r'[【ヿ〓○●◎]', '', entry['text']).replace(" ", "").replace("　", "")
+                    matched_title = ""
+                    for title in position_titles:
+                        if clean_text.startswith(title):
+                            matched_title = title
+                            break
+                    if matched_title:
+                        # Row 1: Position
+                        pos_row = entry.copy()
+                        pos_row['label'] = 'Position'
+                        pos_row['text'] = matched_title
+                        all_data.append(pos_row)
+                        # Prep original entry to become the Name entry
+                        entry['text'] = entry['text'].replace(matched_title, "", 1).strip(" ,、")
+                        entry['label'] = 'NameSudachi'
+                        label = 'NameSudachi'
+
+                if entry['label'] == 'NameSudachi':
+                    # Apply your Pass 1 and Pass 2 Name refinement
+                    p1 = split_names_greedy(entry['text'], tokenizer_obj, mode_c)
+                    entry['text'] = refine_suspicious_names(p1, tokenizer_obj, mode_a)
                 
                 all_data.append(entry)
 
     if all_data:
         df = pd.DataFrame(all_data)
-        cols = ['page_number', 'image_name', 'label', 'text', 'x', 'y', 'w', 'h', 'file_path']
-        cols = [c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]
-        df = df[cols]
+        df.sort_values(by=['sort_folder_num', 'image_name', 'y'], inplace=True)
+        final_cols = ['sort_folder_num', 'page_number', 'image_name', 'label', 'text', 'x', 'y', 'w', 'h', 'file_path']
+        df = df[[c for c in final_cols if c in df.columns]]
         df.to_csv(args.output, index=False)
-        print(f"Success! Saved {len(df)} rows to {args.output}")
+        print(f"Success: Processed {len(df)} rows.")
 
 if __name__ == "__main__":
     main()
