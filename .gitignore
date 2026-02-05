@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Ignore data and results
 input_data/
 output_data_final*
@@ -13,3 +14,8 @@ submodules/
 .conda/
 .venv/
 .DS_Store
+=======
+*.xml
+*.csv
+__pycache__/
+>>>>>>> cluster-cleanup
