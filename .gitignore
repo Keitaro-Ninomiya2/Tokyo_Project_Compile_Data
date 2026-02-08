@@ -1,0 +1,19 @@
+# Data files
+*.csv
+*.xlsx
+*.xml
+*.jpg
+*.png
+*.zip
+
+# Logs and Scratch
+*.out
+scratch/
+NDLoutput/
+Page*/
+
+# Python/Environment
+__pycache__/
+*.pyc
+.env
+venv/
