@@ -19,3 +19,4 @@ submodules/
 *.csv
 __pycache__/
 >>>>>>> cluster-cleanup
+*.out
