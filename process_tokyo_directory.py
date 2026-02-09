@@ -4,257 +4,207 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 import argparse
 import re
-import sys
+from tqdm import tqdm
 
-# Try importing Sudachi
-try:
-    from sudachipy import tokenizer, dictionary
-    SUDACHI_AVAILABLE = True
-except ImportError:
-    SUDACHI_AVAILABLE = False
-    print("Warning: sudachipy not found. Name labeling will be limited.")
-
-# --- Configuration ---
-OFFICE_ENDINGS = ["課", "係", "所", "房", "合", "院", "室", "場", "局", "屋", "寮", "館", "康", "ム", "班", "部", "衛", "宿", "校"]
-DRAFTED_KEYWORDS = ["應召中", "應召", "召中", "應徴中", "應徴", "徴中", "入營中", "入營", "營中"]
-KANJI_NUMBERS = '一二三四五六七八九十百千万'
-RANK_PATTERN = re.compile(r'([正従][一二三四五六七八][位]?)')
-
-def load_position_titles(csv_path, column_name='DuringWar'):
-    if not os.path.exists(csv_path):
-        print(f"CRITICAL ERROR: Crosswalk file not found at {csv_path}")
-        sys.exit(1)
-    try:
-        try:
-            df = pd.read_csv(csv_path, encoding='utf-8')
-        except UnicodeDecodeError:
-            df = pd.read_csv(csv_path, encoding='shift-jis')
-        
-        print(f"--- Crosswalk Debug Info ---")
-        print(f"Requested Column: {column_name}")
-        print(f"Available Columns: {df.columns.tolist()}")
-        
-        if column_name not in df.columns:
-            print(f"ERROR: Column '{column_name}' not found. Using first column.")
-            column_name = df.columns[0]
-            
-        titles = df[column_name].dropna().astype(str).str.strip().unique().tolist()
-        titles = [t for t in titles if len(t) > 1]
-        titles.sort(key=len, reverse=True)
-        print(f"Successfully loaded {len(titles)} unique position titles.")
-        return titles
-    except Exception as e:
-        print(f"Error loading CSV: {e}")
-        sys.exit(1)
-
-def clean_ranks(text):
-    if not text: return text
-    return RANK_PATTERN.sub(r', \1, ', text)
-
-def split_names_greedy(text, tokenizer_obj, mode_c):
-    if not text or not SUDACHI_AVAILABLE: return text
-    text = clean_ranks(text)
-    try:
-        tokens = list(tokenizer_obj.tokenize(text, mode_c))
-        formatted_names = []
-        current_name_parts = []
-        for token in tokens:
-            surface = token.surface()
-            pos = token.part_of_speech()
-            if surface in [',', '、', ' ', '　']:
-                if current_name_parts:
-                    formatted_names.append("".join(current_name_parts))
-                    current_name_parts = []
-                continue
-            is_surname = (len(pos) > 3 and pos[3] == '姓')
-            if is_surname:
-                if current_name_parts:
-                    formatted_names.append("".join(current_name_parts))
-                    current_name_parts = []
-                current_name_parts.append(surface)
-            else:
-                current_name_parts.append(surface)
-        if current_name_parts:
-            formatted_names.append("".join(current_name_parts))
-        return formatted_names
-    except Exception:
-        return [text]
-
-def refine_suspicious_names(name_list, tokenizer_obj, mode_a):
-    if not SUDACHI_AVAILABLE: return ", ".join(name_list)
-    refined_list = []
-    for name_segment in name_list:
-        if len(name_segment) <= 4:
-            refined_list.append(name_segment)
-            continue
-        try:
-            tokens = list(tokenizer_obj.tokenize(name_segment, mode_a))
-            sub_parts = []
-            current_sub = []
-            prev_was_given_name = False
-            for i, token in enumerate(tokens):
-                surface = token.surface()
-                pos = token.part_of_speech()
-                is_noun = (pos[0] == '名詞')
-                is_surname = (len(pos) > 3 and pos[3] == '姓')
-                is_place = (len(pos) > 2 and pos[2] == '地名') 
-                is_given_name = (len(pos) > 3 and pos[3] == '名')
-                should_split = False
-                if i > 0:
-                    if is_surname or is_place or (prev_was_given_name and is_noun):
-                        should_split = True
-                if should_split:
-                    if current_sub:
-                        sub_parts.append("".join(current_sub))
-                        current_sub = []
-                    current_sub.append(surface)
-                else:
-                    current_sub.append(surface)
-                prev_was_given_name = is_given_name
-            if current_sub: sub_parts.append("".join(current_sub))
-            refined_list.extend(sub_parts)
-        except Exception:
-            refined_list.append(name_segment)
-    return ", ".join(refined_list)
-
-def determine_label(text, position_titles, tokenizer_obj, mode):
-    # Strip symbols for cleaner matching
-    text_norm = re.sub(r'[【ヿ〓○●◎]', '', text).replace(" ", "").replace("　", "").strip()
-    if any(text_norm.endswith(char) for char in OFFICE_ENDINGS): return 'Office'
-    if text_norm in position_titles: return 'Position'
-    for title in position_titles:
-        if text_norm.startswith(title) and len(text_norm) > len(title): return 'Position_and_Name'
-    if any(keyword in text_norm for keyword in DRAFTED_KEYWORDS): return 'Drafted'
-    if SUDACHI_AVAILABLE:
-        try:
-            tokens = list(tokenizer_obj.tokenize(text_norm, mode))
-            for token in tokens:
-                pos = token.part_of_speech()
-                if len(pos) > 3 and pos[3] == '姓': return 'NameSudachi'
-        except Exception: pass
-    return None
-
-def parse_xml_to_entries(xml_path):
+def parse_xml_by_page(xml_path):
+    """
+    Parses XML but keeps lines grouped by their PAGE (Crop).
+    Returns a dictionary: { 'image_name': [list_of_lines], ... }
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
-        entries = []
-        for page in root.findall('.//PAGE'):
-            image_name = page.get('IMAGENAME')
-            page_number = ""
-            for block in page.findall('.//BLOCK'):
-                if block.get('TYPE') == 'ノンブル':
-                    page_number = block.get('STRING', "")
-                    break
-            for textblock in page.findall('.//TEXTBLOCK'):
-                for line in textblock.findall('.//LINE'):
-                    string_val = line.get('STRING')
-                    if not string_val: continue
-                    entries.append({
-                        'page_number': page_number, 'text': string_val,
-                        'x': int(line.get('X')), 'y': int(line.get('Y')),
-                        'w': int(line.get('WIDTH')), 'h': int(line.get('HEIGHT')),
-                        'image_name': image_name, 'file_path': xml_path
-                    })
-        return entries
-    except Exception: return []
+    except Exception:
+        return {}
 
-def sort_vertical_columns(entries, tolerance=30):
-    if not entries: return []
-    entries_sorted_x = sorted(entries, key=lambda e: e['x'], reverse=True)
+    pages_data = {}
+
+    for page in root.findall('.//PAGE'):
+        image_name = page.get('IMAGENAME', 'unknown')
+        lines = []
+
+        # STRATEGY 1: Standard NDL
+        for line_node in page.findall('.//LINE'):
+            text = line_node.get('STRING') or line_node.text
+            if text:
+                try:
+                    lines.append({
+                        'text': str(text).strip(),
+                        'x': int(line_node.get('X', 0)),
+                        'y': int(line_node.get('Y', 0)),
+                        'w': int(line_node.get('WIDTH', 0)),
+                        'h': int(line_node.get('HEIGHT', 0))
+                    })
+                except: continue
+
+        # STRATEGY 2: ALTO/New NDL (fallback)
+        if not lines:
+            for string_node in page.findall('.//{*}String'):
+                text = string_node.get('CONTENT')
+                if text:
+                    try:
+                        lines.append({
+                            'text': str(text).strip(),
+                            'x': int(string_node.get('HPOS', 0)),
+                            'y': int(string_node.get('VPOS', 0)),
+                            'w': int(string_node.get('WIDTH', 0)),
+                            'h': int(string_node.get('HEIGHT', 0))
+                        })
+                    except: continue
+
+        if lines:
+            pages_data[image_name] = lines
+
+    return pages_data
+
+def sort_lines_by_columns(lines, tolerance=30):
+    """
+    Groups lines into vertical columns based on X coordinates,
+    then sorts columns Right-to-Left, and lines Top-to-Bottom.
+    """
+    if not lines: return []
+
+    # 1. Sort all lines by X descending (Right to Left)
+    lines_sorted_x = sorted(lines, key=lambda e: e['x'], reverse=True)
+
     columns = []
-    for entry in entries_sorted_x:
-        center_x = entry['x'] + (entry['w'] / 2)
+    for line in lines_sorted_x:
+        center_x = line['x'] + (line['w'] / 2)
         placed = False
+
+        # Try to fit line into an existing column
         for col in columns:
-            col_x_values = [e['x'] + (e['w'] / 2) for e in col]
+            col_x_values = [l['x'] + (l['w'] / 2) for l in col]
             avg_col_x = sum(col_x_values) / len(col_x_values)
+
             if abs(center_x - avg_col_x) < tolerance:
-                col.append(entry)
+                col.append(line)
                 placed = True
                 break
-        if not placed: columns.append([entry])
-    columns.sort(key=lambda col: sum(e['x'] + e['w']/2 for e in col)/len(col), reverse=True)
+
+        if not placed:
+            columns.append([line])
+
+    # 2. Sort the COLUMNS themselves Right-to-Left
+    columns.sort(key=lambda col: sum(l['x'] for l in col)/len(col), reverse=True)
+
     final_sorted = []
     for col in columns:
-        col.sort(key=lambda e: e['y'])
+        # 3. Sort lines WITHIN each column Top-to-Bottom (Y axis)
+        col.sort(key=lambda l: l['y'])
         final_sorted.extend(col)
+
     return final_sorted
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", required=True)
-    parser.add_argument("--crosswalk", required=True)
-    parser.add_argument("--output", default="labeled_output.csv")
+    parser.add_argument("--crosswalk", default="")
+    parser.add_argument("--output", required=True)
     parser.add_argument("--year_col", default="DuringWar")
     args = parser.parse_args()
 
-    # Init Sudachi
-    tokenizer_obj = None
-    mode_c = None
-    mode_a = None
-    if SUDACHI_AVAILABLE:
+    # Load Crosswalk
+    known_titles = set()
+    if args.crosswalk and os.path.exists(args.crosswalk):
         try:
-            tokenizer_obj = dictionary.Dictionary(dict="core").create()
-            mode_c = tokenizer.Tokenizer.SplitMode.C
-            mode_a = tokenizer.Tokenizer.SplitMode.A
-        except Exception: pass
+            cw = pd.read_csv(args.crosswalk)
+            col_to_use = 'Japanese' if 'Japanese' in cw.columns else args.year_col
+            if col_to_use in cw.columns:
+                known_titles = set(cw[col_to_use].dropna().astype(str).unique())
+        except Exception:
+            pass
 
-    position_titles = load_position_titles(args.crosswalk, args.year_col)
-    xml_files = glob.glob(os.path.join(args.input_dir, "**", "input_data.sorted.xml"), recursive=True)
+    print(f"Loaded {len(known_titles)} titles from crosswalk.")
+
+    # Find XML Files
+    xml_files = glob.glob(os.path.join(args.input_dir, "**", "*.xml"), recursive=True)
+    xml_files = [x for x in xml_files if 'mets' not in x.lower()]
+
+    print(f"Found {len(xml_files)} XML files in {args.input_dir}")
+    if not xml_files: return
+
     all_data = []
 
-    for xml_file in xml_files:
-        match = re.search(r'Page(\d+)', xml_file)
-        folder_num = int(match.group(1)) if match else 999999
-        raw_entries = parse_xml_to_entries(xml_file)
-        
-        pages = {}
-        for entry in raw_entries:
-            img = entry['image_name']
-            if img not in pages: pages[img] = []
-            pages[img].append(entry)
-            
-        for page_name in sorted(pages.keys(), key=lambda x: 0 if 'right' in x.lower() else 1):
-            sorted_entries = sort_vertical_columns(pages[page_name])
-            for entry in sorted_entries:
-                label = determine_label(entry['text'], position_titles, tokenizer_obj, mode_c)
-                entry['label'] = label
-                entry['sort_folder_num'] = folder_num
-                
-                # Handling Position Split while preserving original metadata
-                if label == 'Position_and_Name':
-                    clean_text = re.sub(r'[【ヿ〓○●◎]', '', entry['text']).replace(" ", "").replace("　", "")
-                    matched_title = ""
-                    for title in position_titles:
-                        if clean_text.startswith(title):
-                            matched_title = title
-                            break
-                    if matched_title:
-                        # Row 1: Position
-                        pos_row = entry.copy()
-                        pos_row['label'] = 'Position'
-                        pos_row['text'] = matched_title
-                        all_data.append(pos_row)
-                        # Prep original entry to become the Name entry
-                        entry['text'] = entry['text'].replace(matched_title, "", 1).strip(" ,、")
-                        entry['label'] = 'NameSudachi'
-                        label = 'NameSudachi'
+    for xml_file in tqdm(xml_files):
+        # A. Parse Crops
+        pages_dict = parse_xml_by_page(xml_file)
+        if not pages_dict: continue
 
-                if entry['label'] == 'NameSudachi':
-                    # Apply your Pass 1 and Pass 2 Name refinement
-                    p1 = split_names_greedy(entry['text'], tokenizer_obj, mode_c)
-                    entry['text'] = refine_suspicious_names(p1, tokenizer_obj, mode_a)
+        # =========================================================
+        # B. GENERALIZED SORTING LOGIC (Right->Left, Top->Bottom)
+        # =========================================================
+        def page_sort_key(fname):
+            fname = fname.lower()
+            
+            # 1. Primary Sort: Page Side (Right comes before Left)
+            #    If filename contains 'left', rank=1. Else rank=0 (Right).
+            side_rank = 1 if 'left' in fname else 0
+            
+            # 2. Secondary Sort: Vertical Position (Top -> Middle -> Bottom)
+            #    We look for keywords and assign a numeric value.
+            if 'top' in fname:
+                vert_rank = 0
+            elif 'middle' in fname or 'mid' in fname:
+                vert_rank = 1
+            elif 'bottom' in fname or 'bot' in fname:
+                vert_rank = 2
+            else:
+                vert_rank = 0
                 
-                all_data.append(entry)
+            # Returns tuple for sorting: 
+            # (0,0) Right Top -> (0,1) Right Mid -> (0,2) Right Bot
+            # (1,0) Left Top  -> (1,1) Left Mid  -> (1,2) Left Bot
+            return (side_rank, vert_rank, fname)
+
+        sorted_pagenames = sorted(pages_dict.keys(), key=page_sort_key)
+
+        filename = os.path.basename(xml_file)
+        page_match = re.search(r'Page(\d+)', xml_file) or re.search(r'(\d+)', filename)
+        page_num = int(page_match.group(1)) if page_match else 999999
+
+        # C. Process Sorted Crops
+        for img_name in sorted_pagenames:
+            raw_lines = pages_dict[img_name]
+
+            # D. Sort Lines Within Crop (Right-to-Left Columns)
+            sorted_lines = sort_lines_by_columns(raw_lines, tolerance=30)
+
+            for line_obj in sorted_lines:
+                text = line_obj['text']
+
+                # Labeling
+                best_match = None
+                for title in known_titles:
+                    if text.startswith(title):
+                        if best_match is None or len(title) > len(best_match):
+                            best_match = title
+
+                if best_match:
+                    pos = best_match
+                    name = text[len(best_match):].strip()
+                else:
+                    pos = "Unknown"
+                    name = text
+
+                all_data.append({
+                    'office': 'Unknown Office',
+                    'position': pos,
+                    'name': name,
+                    'raw_text': text,
+                    'x': line_obj['x'],
+                    'y': line_obj['y'],
+                    'folder': page_num,
+                    'image': img_name, 
+                    'year': args.year_col
+                })
 
     if all_data:
         df = pd.DataFrame(all_data)
-        df.sort_values(by=['sort_folder_num', 'image_name', 'y'], inplace=True)
-        final_cols = ['sort_folder_num', 'page_number', 'image_name', 'label', 'text', 'x', 'y', 'w', 'h', 'file_path']
-        df = df[[c for c in final_cols if c in df.columns]]
-        df.to_csv(args.output, index=False)
-        print(f"Success: Processed {len(df)} rows.")
+        df.to_csv(args.output, index=False, encoding='utf-8-sig')
+        print(f"Success: Extracted {len(df)} rows.")
+    else:
+        print("Error: No data extracted.")
 
 if __name__ == "__main__":
     main()
