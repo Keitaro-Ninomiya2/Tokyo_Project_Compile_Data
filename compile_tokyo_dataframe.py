@@ -1,147 +1,130 @@
 import pandas as pd
 import argparse
-import os
 import re
+import os
+import sys
 
-def load_position_titles(csv_path, column_name='DuringWar'):
-    if not os.path.exists(csv_path):
-        print(f"Warning: Crosswalk file not found at {csv_path}")
-        return []
-    try:
-        try:
-            df = pd.read_csv(csv_path, encoding='utf-8')
-        except UnicodeDecodeError:
-            df = pd.read_csv(csv_path, encoding='shift-jis')
-        if column_name not in df.columns:
-            column_name = df.columns[0]
-        titles = df[column_name].dropna().unique().tolist()
-        titles.sort(key=len, reverse=True)
-        return titles
-    except Exception as e:
-        print(f"Warning: Could not load crosswalk ({e}).")
-        return []
+def is_header_candidate(text, headers_set):
+    """
+    Returns True if text is likely a Department name.
+    """
+    if pd.isna(text): return False
+    text = str(text).strip()
 
-def parse_imperial_metadata(raw_text):
-    """Dissects strings like '月八五一七上, 時田愼雄' into (CleanName, Salary, Rank)."""
-    if not raw_text: return "", None, None
-    salary_match = re.search(r'月([一二三四五六七八九十百]+)', raw_text)
-    salary = f"月{salary_match.group(1)}" if salary_match else None
-    rank_match = re.search(r'([一二三四五六七八九十])([上下正從])', raw_text)
-    rank = rank_match.group(0) if rank_match else None
-    # Clean name by removing metadata and noise
-    name = re.sub(r'月[一二三四五六七八九十百]+|([一二三四五六七八九十])([上下正從])|[\s,、]+', '', raw_text)
-    name = name.strip(' ,.()=+-〓*')
-    return name, salary, rank
+    # 1. Check Explicit Crosswalk Headers
+    if text in headers_set: return True
 
-def split_position_and_name(text, titles):
-    clean_text = re.sub(r'[【ヿ〓○●◎]', '', str(text).strip())
-    for title in titles:
-        if clean_text.startswith(title):
-            remainder = clean_text[len(title):].strip(" ,　")
-            if remainder: return title, remainder
-    return clean_text, "" 
+    # 2. Heuristics (Ends in Section/Bureau)
+    # Exclude 'Section Chief' (ends in 長) unless it's a known office
+    if len(text) < 15 and re.search(r'(課|係|局|部|署|區|室|寮)$', text):
+        if not text.endswith('長'):
+            return True
+    return False
+
+def parse_metadata(text):
+    """
+    Optional: Extracts Salary/Rank if present in the Name field.
+    """
+    salary = ""
+    rank = ""
+    if not isinstance(text, str): return "", "", ""
+    
+    # Regex for Salary (e.g. 月八五)
+    sal_match = re.search(r'月([一二三四五六七八九十百]+)', text)
+    if sal_match:
+        salary = sal_match.group(1)
+        text = text.replace(sal_match.group(0), "")
+
+    # Regex for Rank (e.g. 正七位)
+    rank_match = re.search(r'([正従][一二三四五六七八][位]?)', text)
+    if rank_match:
+        rank = rank_match.group(1)
+        text = text.replace(rank_match.group(1), "")
+
+    return text.strip(" ,　"), salary, rank
 
 def main():
-    parser = argparse.ArgumentParser(description="Layout-Aware Hierarchy Compiler")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--input_csv", required=True)
     parser.add_argument("--crosswalk", required=True)
-    parser.add_argument("--output", default="Final_Compiled_Directory.csv")
+    parser.add_argument("--output", required=True)
     parser.add_argument("--year_col", default="DuringWar")
     args = parser.parse_args()
 
-    print(f"Loading data from {args.input_csv}...")
-    df = pd.read_csv(args.input_csv).fillna("")
-    known_titles = load_position_titles(args.crosswalk, args.year_col)
+    # print(f"Loading data from {args.input_csv}...")
+    try:
+        df = pd.read_csv(args.input_csv)
+    except Exception as e:
+        print(f"Error loading CSV file: {e}")
+        return
 
-    # Configuration for structural logic
-    SINGULAR_TITLES = ["區長", "局長", "課長", "署長", "館長", "所長", "会長", "院長", "校長"]
-    Y_EPSILON = 10  # Pixels within which fragments are considered on the same 'line'
+    # --- CRITICAL CHANGE ---
+    # WE DO NOT SORT HERE. 
+    # The input CSV is already sorted by Crop Order (Right->Left, Top->Bot) 
+    # and Column Order (Right->Left) by the extraction script.
+    # -----------------------
 
-    current_office = "Unknown Office"
-    current_position = "Employee"
+    # Load Headers
+    headers_set = set()
+    if os.path.exists(args.crosswalk):
+        try:
+            cw = pd.read_csv(args.crosswalk)
+            if 'Is_Header' in cw.columns:
+                headers_set = set(cw[cw['Is_Header'] == 1]['Japanese'].unique())
+        except:
+            pass
+
     compiled_rows = []
+    current_office = "Unknown Office"
 
-    # Step 1: Group by Page to process systematically
-    pages = df.sort_values(by=['page_number', 'y', 'x'])
-    
-    for page_id, page_df in pages.groupby('page_number', sort=False):
-        # Round Y coordinates to group names into physical 'rows'
-        # This allows us to see how many people share a horizontal line
-        page_df = page_df.copy()
-        page_df['y_row'] = (page_df['y'].astype(float) / Y_EPSILON).round() * Y_EPSILON
+    for idx, row in df.iterrows():
+        raw_name = str(row.get('name', '')).strip()
+        raw_pos  = str(row.get('position', '')).strip()
         
-        for y_val, row_group in page_df.groupby('y_row', sort=False):
-            
-            # --- PHASE A: Update Anchors ---
-            # Check if this physical row contains an Office or Position label
-            for _, row in row_group.iterrows():
-                lbl, txt = row['label'], str(row['text']).strip()
-                if lbl == 'Office':
-                    current_office = txt
-                    current_position = "Employee" # Reset position on new office
-                elif lbl == 'Position':
-                    current_position = txt
-                elif lbl == 'Position_and_Name':
-                    pos_part, name_part = split_position_and_name(txt, known_titles)
-                    if pos_part: current_position = pos_part
+        # Skip empty rows
+        if raw_name == "nan": raw_name = ""
+        if raw_pos == "nan": raw_pos = ""
 
-            # --- PHASE B: Count Row Density ---
-            # Identify all name-containing fragments in this row
-            name_fragments = row_group[row_group['label'].isin(['Name', 'NameSudachi', 'Position_and_Name'])]
-            
-            # Extract individual names from fragments (handling comma separation)
-            names_in_row_raw = []
-            for _, n_frag in name_fragments.iterrows():
-                txt = n_frag['text']
-                if n_frag['label'] == 'Position_and_Name':
-                    _, txt = split_position_and_name(txt, known_titles)
-                
-                parts = [p.strip() for p in re.split(r'[,，、]', txt) if len(p.strip()) > 1]
-                names_in_row_raw.extend(parts)
+        # 1. Header Detection
+        # Sometimes a "Name" is actually a Header (e.g. "Civil Engineering Section")
+        # We check raw_name because typically headers appear in the text body
+        if is_header_candidate(raw_name, headers_set):
+            current_office = raw_name
+            # If it's a header line, we generally don't add it as a person record,
+            # we just update the state.
+            continue
+        
+        # 2. Process Person
+        # We only add a row if there is actual content
+        if raw_name or raw_pos:
+            # Extract metadata (Salary/Rank) if mixed in text
+            clean_name, salary, rank = parse_metadata(raw_name)
 
-            names_count = len(names_in_row_raw)
+            entry = {
+                'year': row.get('year', args.year_col),
+                'office': current_office,
+                'position': raw_pos,
+                'name': clean_name,
+                'salary': salary,
+                'rank': rank,
+                'page': row.get('folder', ''),
+                'image': row.get('image', ''),
+                'x': row.get('x', 0),
+                'y': row.get('y', 0)
+            }
+            compiled_rows.append(entry)
 
-            # --- PHASE C: Structural Inference ---
-            # RULE: If 2 or 3 names share a line, they are by definition not 'Singular Elite'
-            # We downgrade the position if it's not a known 'Mass Elite' title like 主事
-            if names_count >= 2:
-                if not any(t in current_position for t in ["主事", "技師"]):
-                    current_position = "雇 (Employee/Stacked)"
-
-            # --- PHASE D: Compile Records ---
-            for entry_text in names_in_row_raw:
-                clean_n, sal, rnk = parse_imperial_metadata(entry_text)
-                if len(clean_n) < 2: continue
-
-                compiled_rows.append({
-                    'folder': row_group.iloc[0].get('sort_folder_num', ''),
-                    'page': page_id,
-                    'image': row_group.iloc[0].get('image_name', ''),
-                    'office': current_office,
-                    'position': current_position,
-                    'name': clean_n,
-                    'salary_kanji': sal,
-                    'rank_kanji': rnk,
-                    'names_per_row': names_count,
-                    'is_elite_structure': names_count == 1,
-                    'drafted': False
-                })
-
-                # One-Shot Title Reset (Ward Mayor etc only apply to the FIRST name found)
-                if names_count == 1 and any(s in current_position for s in SINGULAR_TITLES):
-                    current_position = "Employee"
-
-            # --- PHASE E: Draft Marker ---
-            if any(row_group['label'] == 'Drafted') and compiled_rows:
-                compiled_rows[-1]['drafted'] = True
-
-    # Final Export
     if compiled_rows:
         result_df = pd.DataFrame(compiled_rows)
-        cols = ['office', 'position', 'name', 'salary_kanji', 'rank_kanji', 
-                'names_per_row', 'is_elite_structure', 'drafted', 'folder', 'page', 'image']
-        result_df[cols].to_csv(args.output, index=False, encoding='utf-8-sig')
-        print(f"Success! {len(result_df)} records compiled with layout-aware logic.")
+        
+        # Reorder columns for readability
+        cols = ['year', 'office', 'position', 'name', 'salary', 'rank', 'page', 'image', 'x', 'y']
+        # specific column order if they exist
+        final_cols = [c for c in cols if c in result_df.columns]
+        result_df = result_df[final_cols]
+
+        result_df.to_csv(args.output, index=False, encoding='utf-8-sig')
+        # print(f"Success! Compiled {len(result_df)} records.")
     else:
         print("Error: No entries compiled.")
 
