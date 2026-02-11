@@ -1,22 +1,14 @@
-<<<<<<< HEAD
-# Ignore data and results
-input_data/
-output_data_final*
-*.log
-*.jpg
-*.json
-*.xml
-submodules/
-.conda/
-
-# Ignore system and environment files
-submodules/
-.conda/
-.venv/
-.DS_Store
-=======
-*.xml
+# Ignore data files
 *.csv
-__pycache__/
->>>>>>> cluster-cleanup
+*.partial
+*.xml
+
+# Ignore all Slurm/Job output logs
 *.out
+
+# Ignore Python cache and submodules/docker if you don't want them pushed
+__pycache__/
+.DS_Store
+
+# Keep the scripts but ignore the data folders
+Tokyo_Project_Compile_Data/
