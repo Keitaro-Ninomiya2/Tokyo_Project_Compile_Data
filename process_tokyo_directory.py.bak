@@ -1,0 +1,138 @@
+import os
+import glob
+import pandas as pd
+import xml.etree.ElementTree as ET
+import argparse
+import re
+from tqdm import tqdm
+
+def parse_xml_universal(xml_path):
+    """
+    Parses XMLs for both 1937 (Old NDL) and Post-war formats.
+    """
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        return []
+
+    lines = []
+    
+    # STRATEGY 1: Standard NDL (<LINE STRING="...">)
+    for line_node in root.findall('.//LINE'):
+        text = line_node.get('STRING')
+        if not text and line_node.text:
+            text = line_node.text
+        if text:
+            try:
+                x = int(line_node.get('X', 0))
+                y = int(line_node.get('Y', 0))
+                w = int(line_node.get('WIDTH', 0))
+                h = int(line_node.get('HEIGHT', 0))
+                lines.append({'text': str(text).strip(), 'x': x, 'y': y, 'w': w, 'h': h})
+            except:
+                continue
+
+    # STRATEGY 2: ALTO / New NDL (<String CONTENT="...">)
+    if not lines:
+        for string_node in root.findall('.//{*}String'):
+            text = string_node.get('CONTENT')
+            if text:
+                try:
+                    x = int(string_node.get('HPOS', 0))
+                    y = int(string_node.get('VPOS', 0))
+                    w = int(string_node.get('WIDTH', 0))
+                    h = int(string_node.get('HEIGHT', 0))
+                    lines.append({'text': str(text).strip(), 'x': x, 'y': y, 'w': w, 'h': h})
+                except:
+                    continue
+
+    return lines
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--crosswalk", default="")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--year_col", default="DuringWar")
+    args = parser.parse_args()
+
+    # 1. Load Crosswalk
+    known_titles = set()
+    if args.crosswalk and os.path.exists(args.crosswalk):
+        cw = pd.read_csv(args.crosswalk)
+        # Try both encoding styles just in case
+        if 'Japanese' in cw.columns:
+            known_titles = set(cw['Japanese'].dropna().unique())
+    
+    print(f"Loaded {len(known_titles)} titles from crosswalk.")
+
+    # 2. Find XML Files (Universal Search)
+    # This matches BOTH 'Page001.xml' AND '.../input_data.sorted.xml'
+    xml_files = glob.glob(os.path.join(args.input_dir, "**", "*.xml"), recursive=True)
+    
+    # Filter out non-data xmls if any
+    xml_files = [x for x in xml_files if 'mets' not in x.lower()]
+    
+    print(f"Found {len(xml_files)} XML files in {args.input_dir}")
+
+    if not xml_files:
+        print("Error: No XML files found to process.")
+        return
+
+    all_data = []
+
+    # 3. Process Files
+    for xml_file in tqdm(xml_files):
+        lines = parse_xml_universal(xml_file)
+        if not lines: continue
+
+        # SORTING: Right-to-Left (-x), Top-to-Bottom (y)
+        lines.sort(key=lambda k: (-k['x'], k['y'])) 
+
+        filename = os.path.basename(xml_file)
+        # Extract page number (works for 'Page001.xml' or 'Page001/...')
+        page_match = re.search(r'Page(\d+)', xml_file)
+        if not page_match:
+             page_match = re.search(r'(\d+)', filename)
+        
+        page_num = int(page_match.group(1)) if page_match else 999999
+
+        for line_obj in lines:
+            text = line_obj['text']
+            
+            # Simple "Longest Match" Labeling Strategy
+            best_match = None
+            for title in known_titles:
+                if text.startswith(title):
+                    if best_match is None or len(title) > len(best_match):
+                        best_match = title
+            
+            if best_match:
+                pos = best_match
+                name = text[len(best_match):].strip()
+            else:
+                pos = "Unknown"
+                name = text
+
+            all_data.append({
+                'office': 'Unknown Office',
+                'position': pos,
+                'name': name,
+                'raw_text': text,
+                'x': line_obj['x'],
+                'y': line_obj['y'],
+                'folder': page_num,
+                'image': filename,
+                'year': args.year_col
+            })
+
+    if all_data:
+        df = pd.DataFrame(all_data)
+        df.to_csv(args.output, index=False, encoding='utf-8-sig')
+        print(f"Success: Extracted {len(df)} rows.")
+    else:
+        print("Error: No data extracted (all_data is empty).")
+
+if __name__ == "__main__":
+    main()
