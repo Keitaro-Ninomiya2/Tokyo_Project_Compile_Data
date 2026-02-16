@@ -120,39 +120,35 @@ else:
 
 name_rows = master_df[name_mask].copy()
 
-# Step 1: Exact match grouping by (name, office)
-exact_groups = name_rows.groupby(['name', 'office']).groups
-exact_id_map = {}  # (name, office) -> staff_id
+# Step 1: Exact match grouping by name only (employees move between offices)
+exact_groups = name_rows.groupby('name').groups
+exact_id_map = {}  # name -> staff_id
 
-for (name, office), indices in exact_groups.items():
-    key = (name, office)
-    if key not in exact_id_map:
-        exact_id_map[key] = staff_id_counter
+for name, indices in exact_groups.items():
+    if name not in exact_id_map:
+        exact_id_map[name] = staff_id_counter
         staff_id_counter += 1
     for idx in indices:
-        staff_id_col.iloc[idx] = exact_id_map[key]
+        staff_id_col.iloc[idx] = exact_id_map[name]
 
-# Step 2: Fuzzy match within each office (merge similar names)
-print("     Running fuzzy name matching within offices...")
-office_names = name_rows.groupby('office')['name'].apply(lambda x: list(x.unique()))
+# Step 2: Fuzzy match across all names (merge OCR variants of same person)
+print("     Running fuzzy name matching...")
+all_unique_names = list(name_rows['name'].unique())
 
 merge_map = {}  # old_staff_id -> new_staff_id (for merging clusters)
 
-for office, names in office_names.items():
-    if len(names) < 2:
-        continue
-    # Only fuzzy match names > 2 chars (short names are too risky)
-    long_names = [n for n in names if len(n) > 2]
-    for i in range(len(long_names)):
-        for j in range(i + 1, len(long_names)):
-            sim = name_similarity(long_names[i], long_names[j])
-            if sim >= 0.85:
-                id_i = exact_id_map.get((long_names[i], office))
-                id_j = exact_id_map.get((long_names[j], office))
-                if id_i is not None and id_j is not None and id_i != id_j:
-                    # Merge: map the higher ID to the lower one
-                    high, low = max(id_i, id_j), min(id_i, id_j)
-                    merge_map[high] = low
+# Only fuzzy match names > 2 chars (short names are too risky)
+long_names = [n for n in all_unique_names if len(n) > 2]
+for i in range(len(long_names)):
+    for j in range(i + 1, len(long_names)):
+        sim = name_similarity(long_names[i], long_names[j])
+        if sim >= 0.85:
+            id_i = exact_id_map.get(long_names[i])
+            id_j = exact_id_map.get(long_names[j])
+            if id_i is not None and id_j is not None and id_i != id_j:
+                # Merge: map the higher ID to the lower one
+                high, low = max(id_i, id_j), min(id_i, id_j)
+                merge_map[high] = low
 
 # Apply merge map transitively
 def resolve_id(sid, mmap):
