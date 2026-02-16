@@ -455,6 +455,11 @@ def main():
                 grade = ""
 
             name_flag = is_plausible_name(clean_name)
+
+            # Detect drafted (military conscription) keywords in raw text
+            draft_keywords = ["應召", "召中", "應徴", "徴中", "入營", "營中"]
+            is_drafted = any(k in raw_text for k in draft_keywords)
+
             entry = {
                 'year': row.get('year', args.year_col),
                 'office': current_office,
@@ -462,6 +467,7 @@ def main():
                 'grade': grade,
                 'name': clean_name,
                 'is_name': name_flag,
+                'drafted': is_drafted,
                 'gender_legacy': classify_gender_legacy(clean_name) if name_flag else "",
                 'gender_modern': classify_gender_modern(clean_name) if name_flag else "",
                 'salary': salary,
@@ -478,7 +484,7 @@ def main():
         result_df = pd.DataFrame(compiled_rows)
 
         cols = ['year', 'office', 'position', 'grade', 'name',
-                'is_name', 'gender_legacy', 'gender_modern',
+                'is_name', 'drafted', 'gender_legacy', 'gender_modern',
                 'salary', 'rank', 'page', 'image', 'x', 'y']
         final_cols = [c for c in cols if c in result_df.columns]
         result_df = result_df[final_cols]
@@ -507,6 +513,8 @@ def main():
               f"({100*n_is_name/n_total:.1f}%)")
         print(f"  Female (legacy):         {n_female_legacy}")
         print(f"  Female (modern):         {n_female_modern}")
+        n_drafted = result_df['drafted'].sum()
+        print(f"  Drafted:                 {n_drafted}")
     else:
         print("Error: No entries compiled.")
 
