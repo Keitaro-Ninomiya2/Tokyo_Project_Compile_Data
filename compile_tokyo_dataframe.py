@@ -58,7 +58,8 @@ def is_position_only_row(row, known_positions):
 
 def is_likely_noise(row):
     """
-    Filter out OCR noise from cross-column reads.
+    Filter out OCR noise from cross-column reads, regulatory text,
+    library stamps, page references, and other non-personnel content.
     """
     raw = str(row.get('raw_text', ''))
     name = str(row.get('name', ''))
@@ -79,7 +80,137 @@ def is_likely_noise(row):
     if len(name) == 1 and len(raw) > 15:
         return True
 
+    # 4. Ellipsis/dot patterns (page references like "……一五三")
+    if re.search(r'[…・．\.]{2,}', raw):
+        return True
+
+    # 5. Classical grammar particle density (regulatory text like "ヲ調査蒐録ス")
+    if len(raw) > 8:
+        classical_particles = set('ハノヲニスル')
+        n_particles = sum(1 for c in raw if c in classical_particles)
+        if n_particles / len(raw) > 0.15:
+            return True
+
+    # 6. Library stamps
+    if re.search(r'図書館|蔵書|東京都立', raw):
+        return True
+
+    # 7. Numeric-dominated (>50% digits or kanji numerals)
+    if raw:
+        kanji_nums = set('一二三四五六七八九十百千万〇零')
+        n_numeric = sum(1 for c in raw if c.isdigit() or c in kanji_nums)
+        if len(raw) > 2 and n_numeric / len(raw) > 0.5:
+            return True
+
+    # 8. Phone/address patterns without a valid position
+    if re.search(r'番', raw) and str(row.get('position', '')) == 'Unknown':
+        if re.search(r'[〇一二三四五六七八九十\d].*番', raw):
+            return True
+
     return False
+
+
+def is_plausible_name(name):
+    """
+    Returns True if name looks like a Japanese personal name.
+    Used to flag rows for downstream filtering (is_name column).
+    """
+    if not name or not isinstance(name, str):
+        return False
+    name = name.strip()
+
+    # Length check: Japanese names are 2-8 characters
+    if len(name) < 2 or len(name) > 8:
+        return False
+
+    # Must be >=80% CJK or katakana
+    n_cjk = sum(1 for c in name if '\u4e00' <= c <= '\u9fff'  # CJK unified
+                or '\u30a0' <= c <= '\u30ff'  # Katakana
+                or '\u3400' <= c <= '\u4dbf')  # CJK extension A
+    if n_cjk / len(name) < 0.8:
+        return False
+
+    # Reject hiragana/katakana grammatical particles in names > 3 chars
+    if len(name) > 3 and re.search(r'[のをはがでノヲハガデ]', name):
+        return False
+
+    # Reject strings with classical verb endings (ス,ル,リ,ム) typical of regulatory text
+    if len(name) > 4:
+        classical_particles = set('ハノヲニスルリム')
+        n_particles = sum(1 for c in name if c in classical_particles)
+        if n_particles / len(name) > 0.15:
+            return False
+
+    # Reject strings that are purely kanji numerals
+    kanji_nums = set('一二三四五六七八九十百千万〇零')
+    if all(c in kanji_nums for c in name):
+        return False
+
+    return True
+
+
+def classify_gender_legacy(name):
+    """
+    Gender classification matching the legacy R heuristic.
+    Checks female kanji endings against a surname blocklist.
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    name = name.strip()
+    if not name:
+        return ""
+
+    surname_blocklist = re.compile(
+        r'^(金子|増子|尼子|砂子|白子|呼子|舞子|神子)$')
+    female_kanji_pat = re.compile(r'[子枝江代紀美恵貴]$|婦$|^[小]?[佐]?[美]')
+
+    if surname_blocklist.match(name):
+        return "male"
+    if female_kanji_pat.search(name):
+        return "female"
+    return "male"
+
+
+def classify_gender_modern(name):
+    """
+    Extended gender heuristic with katakana given names and broader kanji endings.
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    name = name.strip()
+    if not name:
+        return ""
+
+    surname_blocklist = re.compile(
+        r'^(金子|増子|尼子|砂子|白子|呼子|舞子|神子|平子|星子|鳴子|'
+        r'銚子|逗子|厨子|対子|硝子|茄子|種子|扇子|格子|障子|帽子)$')
+
+    if surname_blocklist.match(name):
+        return "male"
+
+    # Extended kanji endings
+    female_kanji_pat = re.compile(
+        r'[子枝江代紀美恵貴乃花世奈穂織里香]$|婦$|^[小]?[佐]?[美]')
+    if female_kanji_pat.search(name):
+        return "female"
+
+    # Katakana female given names (common in pre-war/wartime era)
+    katakana_female = {
+        'ヨシ', 'キヨ', 'ハナ', 'ハル', 'フミ', 'トミ', 'チヨ', 'シズ',
+        'ウメ', 'マツ', 'キク', 'ツル', 'ミツ', 'タケ', 'サダ', 'トク',
+        'マサ', 'カネ', 'ヤス', 'ナカ', 'タカ', 'シゲ', 'アキ', 'テル',
+        'ミヨ', 'スミ', 'ノブ', 'ヒデ', 'トシ', 'クニ',
+    }
+    # For 2-char names, check if the whole name matches katakana female
+    if len(name) == 2 and name in katakana_female:
+        return "female"
+    # For longer names, check if the name ends with a katakana female given name
+    if len(name) > 2:
+        suffix = name[-2:]
+        if suffix in katakana_female:
+            return "female"
+
+    return "male"
 
 
 def parse_metadata_fallback(text):
@@ -215,12 +346,16 @@ def main():
                 clean_name, salary, rank = parse_metadata_fallback(raw_name)
                 grade = ""
 
+            name_flag = is_plausible_name(clean_name)
             entry = {
                 'year': row.get('year', args.year_col),
                 'office': current_office,
                 'position': effective_pos,
                 'grade': grade,
                 'name': clean_name,
+                'is_name': name_flag,
+                'gender_legacy': classify_gender_legacy(clean_name) if name_flag else "",
+                'gender_modern': classify_gender_modern(clean_name) if name_flag else "",
                 'salary': salary,
                 'rank': rank,
                 'page': row.get('folder', ''),
@@ -235,6 +370,7 @@ def main():
         result_df = pd.DataFrame(compiled_rows)
 
         cols = ['year', 'office', 'position', 'grade', 'name',
+                'is_name', 'gender_legacy', 'gender_modern',
                 'salary', 'rank', 'page', 'image', 'x', 'y']
         final_cols = [c for c in cols if c in result_df.columns]
         result_df = result_df[final_cols]
@@ -253,6 +389,14 @@ def main():
         print(f"  Position headers found:  {n_position_headers}")
         print(f"  Positions propagated:    {n_position_propagated}")
         print(f"  Noise rows filtered:     {n_noise_filtered}")
+
+        n_is_name = result_df['is_name'].sum()
+        n_female_legacy = (result_df['gender_legacy'] == 'female').sum()
+        n_female_modern = (result_df['gender_modern'] == 'female').sum()
+        print(f"  Plausible names:         {n_is_name} / {n_total} "
+              f"({100*n_is_name/n_total:.1f}%)")
+        print(f"  Female (legacy):         {n_female_legacy}")
+        print(f"  Female (modern):         {n_female_modern}")
     else:
         print("Error: No entries compiled.")
 
