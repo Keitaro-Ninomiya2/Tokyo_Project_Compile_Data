@@ -4,23 +4,54 @@ import re
 import os
 import sys
 
+# --- Sudachi for name validation ---
+try:
+    from sudachipy import dictionary, tokenizer
+    _sudachi_tokenizer = dictionary.Dictionary().create()
+    _sudachi_mode = tokenizer.Tokenizer.SplitMode.C
+    print("SudachiPy initialized for name validation.")
+except ImportError:
+    print("Warning: SudachiPy not found. Falling back to heuristic name validation.")
+    _sudachi_tokenizer = None
+except Exception as e:
+    print(f"Warning: SudachiPy init failed: {e}. Falling back to heuristic.")
+    _sudachi_tokenizer = None
+
 
 def is_header_candidate(text, headers_set):
     """
     Returns True if text is likely a Department/Office name.
+    Detects offices by ending characters (課, 係, 局, etc.) and crosswalk.
+    Leading circle symbols (◎, 〇, ○, etc.) are stripped before checking,
+    as offices may or may not be prefixed with them.
     """
     if pd.isna(text):
         return False
     text = str(text).strip()
+    if not text:
+        return False
 
-    # 1. Check Explicit Crosswalk Headers
-    if text in headers_set:
+    # Reject OCR-malformed headers (leading parentheses/brackets from TOC)
+    if text[0] in '({[（「【':
+        return False
+
+    # Strip leading circle symbols — offices may start with them
+    circle_symbols = "◎〇O○o0〓●"
+    cleaned = text.lstrip(circle_symbols).strip()
+    if not cleaned:
+        return False
+
+    # 1. Check Explicit Crosswalk Headers (both original and circle-stripped)
+    if text in headers_set or cleaned in headers_set:
         return True
 
-    # 2. Heuristics (Ends in Section/Bureau)
-    if len(text) < 15 and re.search(r'(課|係|局|部|署|區|室|寮)$', text):
+    # 2. Pattern-based detection: office names end with these characters
+    office_endings = set("課係所房合院室場局屋寮館康ム班部衛宿校署區")
+    if len(cleaned) < 15 and cleaned[-1] in office_endings:
+        # Reject position titles like 課長, 部長 (office ending + 長)
         if not text.endswith('長'):
             return True
+
     return False
 
 
@@ -110,10 +141,57 @@ def is_likely_noise(row):
     return False
 
 
+# Katakana given names that Sudachi classifies as common nouns rather than person names.
+# These are unambiguously names in a personnel directory context.
+_KATAKANA_GIVEN_NAMES = {
+    'ヨシ', 'キヨ', 'ハナ', 'ハル', 'フミ', 'トミ', 'チヨ', 'シズ',
+    'ウメ', 'マツ', 'キク', 'ツル', 'ミツ', 'タケ', 'サダ', 'トク',
+    'マサ', 'カネ', 'ヤス', 'ナカ', 'タカ', 'シゲ', 'アキ', 'テル',
+    'ミヨ', 'スミ', 'ノブ', 'ヒデ', 'トシ', 'クニ', 'イネ', 'トメ',
+    'スエ', 'タミ', 'ヒサ', 'ムメ', 'リン', 'セツ', 'ミネ', 'フク',
+}
+
+
+def _sudachi_has_person_name(name):
+    """
+    Uses SudachiPy to check if the string contains person-name tokens.
+    Returns True if at least one token is tagged 名詞/固有名詞/人名
+    AND at least one person-name token is 2+ characters long.
+
+    Single-kanji surname+given name pairs (e.g. 衞+務, 表+玄) are
+    almost always OCR fragments, not real names. Real Japanese names
+    have multi-character surnames (田中, 鈴木) or given names (太郎, 啓子).
+    """
+    if name in _KATAKANA_GIVEN_NAMES:
+        return True
+    tokens = _sudachi_tokenizer.tokenize(name, _sudachi_mode)
+    name_chars = 0
+    has_multi_char_token = False
+    has_surname = False
+    for token in tokens:
+        pos = token.part_of_speech()
+        if pos[0] == '名詞' and pos[1] == '固有名詞' and pos[2] == '人名':
+            surface = token.surface()
+            name_chars += len(surface)
+            if len(surface) >= 2:
+                has_multi_char_token = True
+            if pos[3] == '姓':
+                has_surname = True
+    if name_chars < len(name) * 0.5:
+        return False
+    if not has_multi_char_token:
+        return False
+    # A standalone given name (no surname) must be 3+ chars to be credible
+    if not has_surname and len(name) <= 2:
+        return False
+    return True
+
+
 def is_plausible_name(name):
     """
     Returns True if name looks like a Japanese personal name.
-    Used to flag rows for downstream filtering (is_name column).
+    Primary: SudachiPy morphological analysis (人名 token check).
+    Fallback: basic length/CJK heuristic if Sudachi unavailable.
     """
     if not name or not isinstance(name, str):
         return False
@@ -124,24 +202,27 @@ def is_plausible_name(name):
         return False
 
     # Must be >=80% CJK or katakana
-    n_cjk = sum(1 for c in name if '\u4e00' <= c <= '\u9fff'  # CJK unified
-                or '\u30a0' <= c <= '\u30ff'  # Katakana
-                or '\u3400' <= c <= '\u4dbf')  # CJK extension A
+    n_cjk = sum(1 for c in name if '\u4e00' <= c <= '\u9fff'
+                or '\u30a0' <= c <= '\u30ff'
+                or '\u3400' <= c <= '\u4dbf')
     if n_cjk / len(name) < 0.8:
         return False
 
-    # Reject hiragana/katakana grammatical particles in names > 3 chars
+    # Use Sudachi if available
+    if _sudachi_tokenizer is not None:
+        return _sudachi_has_person_name(name)
+
+    # --- Heuristic fallback (only if Sudachi unavailable) ---
+    if re.search(r'[年月日]', name):
+        return False
+    if re.search(r'昭和|大正|明治|平成|現在|以上|以下', name):
+        return False
+    if re.search(r'[號條項則級俸給勳位階官]', name):
+        return False
+    if re.search(r'[課係局部署區室寮所院庁]$', name) and len(name) > 2:
+        return False
     if len(name) > 3 and re.search(r'[のをはがでノヲハガデ]', name):
         return False
-
-    # Reject strings with classical verb endings (ス,ル,リ,ム) typical of regulatory text
-    if len(name) > 4:
-        classical_particles = set('ハノヲニスルリム')
-        n_particles = sum(1 for c in name if c in classical_particles)
-        if n_particles / len(name) > 0.15:
-            return False
-
-    # Reject strings that are purely kanji numerals
     kanji_nums = set('一二三四五六七八九十百千万〇零')
     if all(c in kanji_nums for c in name):
         return False
@@ -241,6 +322,10 @@ def main():
     parser.add_argument("--crosswalk", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--year_col", default="DuringWar")
+    parser.add_argument("--start_page", type=int, default=None,
+                        help="First page of personnel data (skip preamble before this)")
+    parser.add_argument("--end_page", type=int, default=None,
+                        help="Last page of personnel data (skip appendix after this)")
     args = parser.parse_args()
 
     try:
@@ -276,6 +361,13 @@ def main():
     # --- Single-person positions: only the first name gets the title ---
     single_person_positions = {'課長', '主事', '技師'}
 
+    # --- Page range filtering ---
+    use_page_range = args.start_page is not None or args.end_page is not None
+    if use_page_range:
+        start_pg = args.start_page if args.start_page is not None else 0
+        end_pg = args.end_page if args.end_page is not None else 999999
+        print(f"Page range filter: pages {start_pg} to {end_pg}")
+
     # --- Main compilation loop ---
     compiled_rows = []
     current_office = "Unknown Office"
@@ -283,6 +375,7 @@ def main():
     position_person_count = 0  # Track how many people assigned current position
 
     n_noise_filtered = 0
+    n_page_filtered = 0
     n_position_headers = 0
     n_position_propagated = 0
 
@@ -293,18 +386,33 @@ def main():
         if raw_name == "nan": raw_name = ""
         if raw_pos == "nan": raw_pos = ""
 
-        # --- Step 0: Filter OCR noise ---
+        # --- Step 0a: Page range filter (human-specified) ---
+        if use_page_range:
+            page_num = int(row.get('folder', 0))
+            if page_num < start_pg or page_num > end_pg:
+                n_page_filtered += 1
+                continue
+
+        # --- Step 0b: Filter OCR noise ---
         if is_likely_noise(row):
             n_noise_filtered += 1
             continue
 
-        # --- Step 1: Office header detection ---
+        # --- Step 1: Office header detection (pattern-based) ---
+        raw_text = str(row.get('raw_text', '')).strip()
+        if raw_text == "nan": raw_text = ""
+
         if is_header_candidate(raw_name, headers_set):
             current_office = raw_name
             continue
         if raw_pos and is_header_candidate(raw_pos, headers_set):
             current_office = raw_pos
             continue
+        # Also check raw_text for office names that stage 1 didn't classify
+        if raw_text and not raw_name and not raw_pos:
+            if is_header_candidate(raw_text, headers_set):
+                current_office = raw_text
+                continue
 
         # --- Step 2: Standalone position header detection ---
         is_pos_header, detected_pos = is_position_only_row(
@@ -388,6 +496,8 @@ def main():
               f"({100*n_with_pos/n_total:.1f}%)")
         print(f"  Position headers found:  {n_position_headers}")
         print(f"  Positions propagated:    {n_position_propagated}")
+        if use_page_range:
+            print(f"  Page-range filtered:     {n_page_filtered}")
         print(f"  Noise rows filtered:     {n_noise_filtered}")
 
         n_is_name = result_df['is_name'].sum()
