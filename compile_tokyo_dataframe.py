@@ -294,6 +294,190 @@ def classify_gender_modern(name):
     return "male"
 
 
+# ============================================================
+# Office hierarchy inference
+# ============================================================
+
+# 旧字体 → 新字体 character normalization map
+KYUJI_MAP = str.maketrans({
+    '總': '総', '經': '経', '濟': '済', '勞': '労', '藥': '薬', '會': '会',
+    '區': '区', '學': '学', '營': '営', '國': '国', '實': '実', '產': '産',
+    '醫': '医', '檢': '検', '衞': '衛', '稅': '税', '關': '関', '灣': '湾',
+    '觀': '観', '權': '権', '獸': '獣', '險': '険', '驗': '験', '雜': '雑',
+    '對': '対', '畫': '画', '處': '処', '兒': '児', '賣': '売', '靈': '霊',
+    '澁': '渋', '淺': '浅', '收': '収', '纖': '繊', '廳': '庁', '廣': '広',
+    '鐵': '鉄', '證': '証', '條': '条', '單': '単',
+})
+
+_OFFICE_LEADING_SYMBOLS = '〓◇△○□〔◎〇Oo0●'
+
+# Level-3 compound endings — sorted longest-first so maximal match wins
+_L3_COMPOUNDS = sorted([
+    '地方事務所', '出納員室',
+    '営業所', '出張所', '試験所', '研究所', '事務所', '事業所', '保健所',
+    '清掃所', '取締所', '指導所', '訓練所', '検定所', '相談所', '処分場',
+    '作業所', '診療所', '保養所', '授産場', '種畜場', '消毒所',
+    '試験場', '区役所',
+    '工場', '分場', '支所',
+], key=len, reverse=True)
+
+# Level-1 exact matches (checked before any suffix rule)
+_L1_EXACT = frozenset({'知事室', '出納長室', '中央卸売市場'})
+
+# 院-ending names that are NOT level-1
+_L1_BLOCKED_IN = ('分院', '病院', '乳児院', '看護学院')
+
+# Level-3 simple suffixes (checked after compounds)
+_L3_SIMPLE = ('課', '室', '署', '場', '所')
+
+
+def normalize_office(text):
+    """Strip leading symbols and apply 旧字体→新字体 normalization."""
+    if not isinstance(text, str) or not text:
+        return ''
+    text = text.strip().lstrip(_OFFICE_LEADING_SYMBOLS).strip()
+    return text.translate(KYUJI_MAP)
+
+
+def classify_office_level(normed):
+    """
+    Classify a normalized office name to its hierarchy level.
+    Returns 1 (局), 2 (部), 3 (課-equivalent), 4 (係), or None if unmatched.
+
+    Check order (longest/most-specific first):
+      1. Level-1 exact matches
+      2. Level-3 compound endings (longest first)
+      3. Level-4 (ends with 係)
+      4. Level-1 (ends with 局 or qualifying 院)
+      5. Level-2 (ends with 部)
+      6. Level-3 simple endings (課 室 署 場 所)
+    """
+    if not normed:
+        return None
+    # 1. Level-1 exact matches
+    if normed in _L1_EXACT:
+        return 1
+    # 2. Level-3 compound endings
+    for comp in _L3_COMPOUNDS:
+        if normed.endswith(comp):
+            return 3
+    # 3. Level-4
+    if normed.endswith('係'):
+        return 4
+    # 4. Level-1: 局, or 院 not in blocked list
+    if normed.endswith('局'):
+        return 1
+    if normed.endswith('院') and not any(normed.endswith(b) for b in _L1_BLOCKED_IN):
+        return 1
+    # 5. Level-2
+    if normed.endswith('部'):
+        return 2
+    # 6. Level-3 simple
+    for suf in _L3_SIMPLE:
+        if normed.endswith(suf):
+            return 3
+    return None
+
+
+def infer_office_hierarchy(df):
+    """
+    Add office hierarchy columns to the compiled DataFrame.
+
+    New columns added:
+      office_norm  — normalized office name (旧字体→新字体, leading symbols stripped)
+      off_level    — hierarchy level: 1=局, 2=部, 3=課-equivalent, 4=係 (NaN if unmatched)
+      kyoku        — 局 this row belongs to (forward-filled within year)
+      bu           — 部 this row belongs to (resets on new 局 or 部)
+      ka           — 課 this row belongs to (resets on new 局, 部, or 課)
+      kakari       — 係 this row belongs to (resets on any new level)
+
+    Uses the cumulative-group technique: a new group starts whenever a
+    header of the relevant level (or higher) transitions in, then all rows
+    in that group are filled with the header value via groupby-first.
+    """
+    df = df.copy()
+    df['office_norm'] = df['office'].apply(normalize_office)
+    df['off_level'] = df['office_norm'].apply(classify_office_level)
+
+    parts = []
+    for _year, ydf in df.groupby('year', sort=False):
+        ydf = ydf.copy()
+
+        # Detect rows where the office section transitions
+        changed = ydf['office'] != ydf['office'].shift()
+        lvl = ydf['off_level']
+
+        is_l1 = (lvl == 1) & changed
+        is_l2 = (lvl == 2) & changed
+        is_l3 = (lvl == 3) & changed
+        is_l4 = (lvl == 4) & changed
+
+        # Cumulative group IDs — increment at each relevant transition
+        kyoku_grp  = is_l1.cumsum()
+        bu_grp     = (is_l1 | is_l2).cumsum()
+        ka_grp     = (is_l1 | is_l2 | is_l3).cumsum()
+        kakari_grp = (is_l1 | is_l2 | is_l3 | is_l4).cumsum()
+
+        # Place the office name only at the header row that opens each group
+        norm = ydf['office_norm']
+        ydf['_k']  = norm.where(is_l1)
+        ydf['_b']  = norm.where(is_l2)
+        ydf['_ka'] = norm.where(is_l3)
+        ydf['_kk'] = norm.where(is_l4)
+
+        # Forward-fill: all rows in a group receive the header value
+        # groupby().first() skips NaN, so only the non-NaN header value propagates
+        ydf['kyoku']  = ydf.groupby(kyoku_grp )['_k' ].transform('first')
+        ydf['bu']     = ydf.groupby(bu_grp    )['_b' ].transform('first')
+        ydf['ka']     = ydf.groupby(ka_grp    )['_ka'].transform('first')
+        ydf['kakari'] = ydf.groupby(kakari_grp)['_kk'].transform('first')
+
+        ydf.drop(columns=['_k', '_b', '_ka', '_kk'], inplace=True)
+        parts.append(ydf)
+
+    return pd.concat(parts) if parts else df
+
+
+def _print_hierarchy_diagnostics(df):
+    """Print hierarchy inference summary and unmatched office names."""
+    n = len(df)
+    level_labels = {1: '局', 2: '部', 3: '課-eq', 4: '係'}
+
+    print("\n--- Office hierarchy level distribution ---")
+    for lvl, label in sorted(level_labels.items()):
+        mask = df['off_level'] == lvl
+        n_rows = int(mask.sum())
+        n_unique = int(df.loc[mask, 'office_norm'].nunique())
+        print(f"  Level {lvl} ({label:5s}): {n_rows:6d} rows, {n_unique:4d} unique offices")
+    n_none = int(df['off_level'].isna().sum())
+    print(f"  Unmatched:         {n_none:6d} rows")
+
+    print("\n--- Hierarchy fill rates ---")
+    for col in ('kyoku', 'bu', 'ka', 'kakari'):
+        n_filled = int(df[col].notna().sum())
+        pct = 100 * n_filled / n if n else 0.0
+        print(f"  {col:8s}: {n_filled:6d} / {n} ({pct:.1f}%)")
+
+    # Unmatched Japanese office names — useful for rule refinement
+    has_cjk = df['office_norm'].str.contains(
+        r'[\u4e00-\u9fff\u3400-\u4dbf]', regex=True, na=False)
+    unmatched = (
+        df[df['off_level'].isna() & has_cjk]
+        .groupby('office_norm', dropna=False)
+        .size()
+        .sort_values(ascending=False)
+    )
+    if len(unmatched):
+        print(f"\n--- Unmatched Japanese office names "
+              f"({len(unmatched)} unique, {int(unmatched.sum())} rows) ---")
+        for name, cnt in unmatched.head(30).items():
+            print(f"  {cnt:4d}  {name!r}")
+        if len(unmatched) > 30:
+            print(f"  ... and {len(unmatched) - 30} more")
+    else:
+        print("\nAll Japanese office names matched a hierarchy level.")
+
+
 def parse_metadata_fallback(text):
     """
     Fallback metadata extraction for v1 format CSVs.
@@ -483,7 +667,13 @@ def main():
     if compiled_rows:
         result_df = pd.DataFrame(compiled_rows)
 
-        cols = ['year', 'office', 'position', 'grade', 'name',
+        # --- Infer office hierarchy ---
+        result_df = infer_office_hierarchy(result_df)
+        _print_hierarchy_diagnostics(result_df)
+
+        cols = ['year', 'office', 'office_norm', 'off_level',
+                'kyoku', 'bu', 'ka', 'kakari',
+                'position', 'grade', 'name',
                 'is_name', 'drafted', 'gender_legacy', 'gender_modern',
                 'salary', 'rank', 'page', 'image', 'x', 'y']
         final_cols = [c for c in cols if c in result_df.columns]
