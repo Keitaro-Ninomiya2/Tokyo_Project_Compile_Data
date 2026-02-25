@@ -298,18 +298,24 @@ def classify_gender_modern(name):
 # Office hierarchy inference
 # ============================================================
 
-# 旧字体 → 新字体 character normalization map
+# 旧字体 → 新字体 character normalization map (matches R's kyujitai_map)
 KYUJI_MAP = str.maketrans({
     '總': '総', '經': '経', '濟': '済', '勞': '労', '藥': '薬', '會': '会',
-    '區': '区', '學': '学', '營': '営', '國': '国', '實': '実', '產': '産',
-    '醫': '医', '檢': '検', '衞': '衛', '稅': '税', '關': '関', '灣': '湾',
-    '觀': '観', '權': '権', '獸': '獣', '險': '険', '驗': '験', '雜': '雑',
-    '對': '対', '畫': '画', '處': '処', '兒': '児', '賣': '売', '靈': '霊',
-    '澁': '渋', '淺': '浅', '收': '収', '纖': '繊', '廳': '庁', '廣': '広',
-    '鐵': '鉄', '證': '証', '條': '条', '單': '単',
+    '區': '区', '廳': '庁', '學': '学', '廣': '広', '營': '営', '國': '国',
+    '圖': '図', '實': '実', '產': '産', '壽': '寿', '從': '従', '體': '体',
+    '鐵': '鉄', '醫': '医', '檢': '検', '證': '証', '衞': '衛', '稅': '税',
+    '樂': '楽', '氣': '気', '關': '関', '參': '参', '與': '与', '專': '専',
+    '灣': '湾', '廢': '廃', '轉': '転', '觀': '観', '權': '権', '條': '条',
+    '獸': '獣', '據': '拠', '錢': '銭', '險': '険', '驗': '験', '單': '単',
+    '雜': '雑', '藏': '蔵', '對': '対', '應': '応', '畫': '画', '處': '処',
+    '變': '変', '數': '数', '豐': '豊', '邊': '辺', '遞': '逓', '鑛': '鉱',
+    '纖': '繊', '兒': '児', '賣': '売', '劃': '画', '靈': '霊', '澁': '渋',
+    '淺': '浅', '鷗': '鴎', '壓': '圧', '收': '収', '榮': '栄', '齋': '斎',
+    '齊': '斉', '辯': '弁',
 })
 
-_OFFICE_LEADING_SYMBOLS = '〓◇△○□〔◎〇Oo0●'
+# Leading symbols stripped from the start of office names (matches R's pattern)
+_OFFICE_LEADING_SYMBOLS = '〓◇◆△▲○●□■☆★※＊・〔〕〃◎〇Oo0'
 
 # Level-3 compound endings — sorted longest-first so maximal match wins
 _L3_COMPOUNDS = sorted([
@@ -332,10 +338,14 @@ _L3_SIMPLE = ('課', '室', '署', '場', '所')
 
 
 def normalize_office(text):
-    """Strip leading symbols and apply 旧字体→新字体 normalization."""
+    """Strip leading symbols/parentheticals and apply 旧字体→新字体 normalization."""
     if not isinstance(text, str) or not text:
         return ''
-    text = text.strip().lstrip(_OFFICE_LEADING_SYMBOLS).strip()
+    text = text.strip()
+    # Strip leading circle/marker symbols (matches R's first str_remove)
+    text = text.lstrip(_OFFICE_LEADING_SYMBOLS).strip()
+    # Strip leading parenthetical expressions, e.g. （局名）or (注記) (matches R's second str_remove)
+    text = re.sub(r'^[（(〔][^）)〕]*[）)〕]?', '', text).strip()
     return text.translate(KYUJI_MAP)
 
 
@@ -435,7 +445,25 @@ def infer_office_hierarchy(df):
         ydf.drop(columns=['_k', '_b', '_ka', '_kk'], inplace=True)
         parts.append(ydf)
 
-    return pd.concat(parts) if parts else df
+    result = pd.concat(parts) if parts else df
+
+    # Detect index pages: pages with 3+ distinct 局-level offices on one page
+    # (matches R's section 4 — flag but do not drop; caller can filter)
+    if 'page' in result.columns:
+        l1_per_page = (
+            result[result['off_level'] == 1]
+            .groupby(['year', 'page'])['office_norm']
+            .nunique()
+        )
+        index_pairs = set(l1_per_page[l1_per_page >= 3].index)
+        result['is_index_page'] = [
+            (y, p) in index_pairs
+            for y, p in zip(result['year'], result['page'])
+        ]
+    else:
+        result['is_index_page'] = False
+
+    return result
 
 
 def _print_hierarchy_diagnostics(df):
@@ -672,7 +700,7 @@ def main():
         _print_hierarchy_diagnostics(result_df)
 
         cols = ['year', 'office', 'office_norm', 'off_level',
-                'kyoku', 'bu', 'ka', 'kakari',
+                'kyoku', 'bu', 'ka', 'kakari', 'is_index_page',
                 'position', 'grade', 'name',
                 'is_name', 'drafted', 'gender_legacy', 'gender_modern',
                 'salary', 'rank', 'page', 'image', 'x', 'y']
